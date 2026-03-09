@@ -1,0 +1,12 @@
+{
+  "name": "test3",
+  "version": "1.0.0",
+  "description": "Chat UI with LLM and MCP server integration",
+  "scripts": {
+    "dev": "concurrently \"cd backend && go run main.go\" \"cd frontend && npm run dev\"",
+    "build": "cd backend && go build ./... && cd ../frontend && npm run build"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.0"
+  }
+}
