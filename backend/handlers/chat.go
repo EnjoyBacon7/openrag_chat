@@ -92,22 +92,35 @@ func buildLLMHistory(messages []models.Message) []llm.ChatMessage {
 	return out
 }
 
-// connectMCP connects to the conversation's MCP server if configured.
-// Returns nil, nil if no MCP server is configured or connection fails.
-func connectMCP(database *db.DB, conv *models.ConversationWithMessages) (*mcpclient.Client, []models.MCPTool) {
-	if conv.MCPServerID == "" {
+// connectMCPs connects to all MCP servers configured on the conversation.
+// Returns a slice of connected clients and the merged list of all tools.
+// Servers that fail to connect are silently skipped.
+func connectMCPs(database *db.DB, conv *models.ConversationWithMessages) ([]*mcpclient.Client, []models.MCPTool) {
+	ids := conv.MCPServerIDs
+	// Fallback: if the new field is empty but the legacy field is set, use it.
+	if len(ids) == 0 && conv.MCPServerID != "" {
+		ids = []string{conv.MCPServerID}
+	}
+	if len(ids) == 0 {
 		return nil, nil
 	}
-	srv, err := database.GetMCPServer(conv.MCPServerID)
-	if err != nil || srv == nil {
-		return nil, nil
+
+	var clients []*mcpclient.Client
+	var allTools []models.MCPTool
+	for _, id := range ids {
+		srv, err := database.GetMCPServer(id)
+		if err != nil || srv == nil {
+			continue
+		}
+		cli := mcpNewClient(srv.URL, srv.APIKey, srv.Transport)
+		if err := cli.Connect(); err != nil {
+			log.Printf("MCP connect error (server %s): %v", id, err)
+			continue
+		}
+		clients = append(clients, cli)
+		allTools = append(allTools, cli.Tools()...)
 	}
-	cli := mcpNewClient(srv.URL, srv.APIKey, srv.Transport)
-	if err := cli.Connect(); err != nil {
-		log.Printf("MCP connect error: %v", err)
-		return nil, nil
-	}
-	return cli, cli.Tools()
+	return clients, allTools
 }
 
 func (h *ChatHandler) Send(w http.ResponseWriter, r *http.Request) {
@@ -155,7 +168,7 @@ func (h *ChatHandler) Send(w http.ResponseWriter, r *http.Request) {
 	userContent := req.Content
 	chatMessages = append(chatMessages, llm.ChatMessage{Role: "user", Content: &userContent})
 
-	mcpCli, mcpTools := connectMCP(h.DB, conv)
+	mcpClients, mcpTools := connectMCPs(h.DB, conv)
 
 	flusher := setupSSE(w)
 	if flusher == nil {
@@ -163,10 +176,10 @@ func (h *ChatHandler) Send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	streamCb, toolUseCb, toolResultCb := sseCallbacks(w, flusher, h.DB, req.ConversationID)
+	streamCb, toolUseCb, toolResultCb, usageCb, assistantToolCallsCb := sseCallbacks(w, flusher, h.DB, req.ConversationID)
 
 	llmClient := llm.NewClient(*modelCfg)
-	fullResponse, _, err := llmClient.SendMessage(r.Context(), chatMessages, mcpTools, mcpCli, streamCb, toolUseCb, toolResultCb)
+	fullResponse, _, err := llmClient.SendMessage(r.Context(), chatMessages, mcpTools, mcpClients, streamCb, toolUseCb, toolResultCb, usageCb, assistantToolCallsCb)
 	if err != nil {
 		// If the request was cancelled (user stopped generation), save whatever
 		// partial content was already streamed and close cleanly without an error event.
@@ -275,7 +288,7 @@ func (h *ChatHandler) Edit(w http.ResponseWriter, r *http.Request) {
 	newContent := req.NewContent
 	chatMessages = append(chatMessages, llm.ChatMessage{Role: "user", Content: &newContent})
 
-	mcpCli, mcpTools := connectMCP(h.DB, conv)
+	mcpClients, mcpTools := connectMCPs(h.DB, conv)
 
 	flusher := setupSSE(w)
 	if flusher == nil {
@@ -283,10 +296,10 @@ func (h *ChatHandler) Edit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	streamCb, toolUseCb, toolResultCb := sseCallbacks(w, flusher, h.DB, req.ConversationID)
+	streamCb, toolUseCb, toolResultCb, usageCb, assistantToolCallsCb := sseCallbacks(w, flusher, h.DB, req.ConversationID)
 
 	llmClient := llm.NewClient(*modelCfg)
-	fullResponse, _, err := llmClient.SendMessage(r.Context(), chatMessages, mcpTools, mcpCli, streamCb, toolUseCb, toolResultCb)
+	fullResponse, _, err := llmClient.SendMessage(r.Context(), chatMessages, mcpTools, mcpClients, streamCb, toolUseCb, toolResultCb, usageCb, assistantToolCallsCb)
 	if err != nil {
 		// If the request was cancelled (user stopped generation), save partial content.
 		if r.Context().Err() != nil {

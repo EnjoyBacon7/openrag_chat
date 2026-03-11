@@ -30,12 +30,16 @@ type MCPServer struct {
 
 // Conversation represents a chat conversation.
 type Conversation struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title"`
-	ModelID     string    `json:"model_id"`
-	MCPServerID string    `json:"mcp_server_id,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID               string    `json:"id"`
+	Title            string    `json:"title"`
+	ModelID          string    `json:"model_id"`
+	MCPServerID      string    `json:"mcp_server_id,omitempty"` // legacy single-server field, kept for backward compat
+	MCPServerIDs     []string  `json:"mcp_server_ids"`
+	PromptTokens     int       `json:"prompt_tokens"`
+	CompletionTokens int       `json:"completion_tokens"`
+	TotalTokens      int       `json:"total_tokens"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // Message represents a single message in a conversation.
@@ -104,13 +108,15 @@ type UpdateMCPServerRequest struct {
 }
 
 type CreateConversationRequest struct {
-	Title       string `json:"title,omitempty"`
-	ModelID     string `json:"model_id"`
-	MCPServerID string `json:"mcp_server_id,omitempty"`
+	Title        string   `json:"title,omitempty"`
+	ModelID      string   `json:"model_id"`
+	MCPServerIDs []string `json:"mcp_server_ids,omitempty"`
 }
 
 type UpdateConversationRequest struct {
-	Title *string `json:"title,omitempty"`
+	Title        *string   `json:"title,omitempty"`
+	ModelID      *string   `json:"model_id,omitempty"`
+	MCPServerIDs *[]string `json:"mcp_server_ids,omitempty"`
 }
 
 type SendMessageRequest struct {

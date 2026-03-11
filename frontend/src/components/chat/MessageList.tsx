@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
-import { Wrench, ChevronDown, ChevronRight, Info, Pencil, X, Check, FileText } from 'lucide-react';
+import { Wrench, ChevronDown, ChevronRight, Pencil, X, Check, FileText } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAppStore } from '../../store';
@@ -304,6 +304,7 @@ function MessageBubble({ message, isStreaming, conversationId }: MessageBubblePr
   const appendStreamingContent = useAppStore((s) => s.appendStreamingContent);
   const resetStreamingContent = useAppStore((s) => s.resetStreamingContent);
   const loadConversations = useAppStore((s) => s.loadConversations);
+  const setLastUsage = useAppStore((s) => s.setLastUsage);
 
   // Cancel any in-flight edit stream on unmount
   useEffect(() => {
@@ -388,11 +389,15 @@ function MessageBubble({ message, isStreaming, conversationId }: MessageBubblePr
           created_at: new Date().toISOString(),
         });
       },
+      undefined, // onAbort
+      (usage) => {
+        setLastUsage(usage);
+      },
     );
   }, [
     editText, message.id, message.content, conversationId,
     replaceMessagesFrom, addMessage, setIsStreaming, appendStreamingContent,
-    resetStreamingContent, loadConversations,
+    resetStreamingContent, loadConversations, setLastUsage,
   ]);
 
   const handleCancelEdit = useCallback(() => {
@@ -533,30 +538,11 @@ function StreamingBubble({ content }: { content: string }) {
 // How far from the bottom (px) the user must be before we stop auto-scrolling.
 const SCROLL_THRESHOLD = 80;
 
-function SelectionChangeBanner({ text }: { text: string }) {
-  return (
-    <div className="flex justify-center">
-      <div
-        className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs"
-        style={{
-          backgroundColor: 'var(--color-bg-secondary)',
-          border: '1px solid var(--color-border)',
-          color: 'var(--color-text-secondary)',
-        }}
-      >
-        <Info size={12} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
-        {text}
-      </div>
-    </div>
-  );
-}
-
 export default function MessageList() {
   const messages = useAppStore((s) => s.activeMessages);
   const activeConversationId = useAppStore((s) => s.activeConversationId);
   const isStreaming = useAppStore((s) => s.isStreaming);
   const streamingContent = useAppStore((s) => s.streamingContent);
-  const selectionChangeBanner = useAppStore((s) => s.selectionChangeBanner);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // Whether the user is close enough to the bottom that we should follow new content.
@@ -681,9 +667,6 @@ export default function MessageList() {
             />
           );
         })}
-        {selectionChangeBanner && !isStreaming && (
-          <SelectionChangeBanner text={selectionChangeBanner} />
-        )}
         {isStreaming && <StreamingBubble content={streamingContent} />}
       </div>
     </div>

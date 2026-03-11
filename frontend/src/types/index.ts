@@ -26,7 +26,11 @@ export interface Conversation {
   id: string;
   title: string;
   model_id: string;
-  mcp_server_id?: string;
+  mcp_server_id?: string;    // legacy single-server field, kept for backward compat
+  mcp_server_ids: string[];
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
   created_at: string;
   updated_at: string;
 }
@@ -94,7 +98,13 @@ export interface CreateMCPServerRequest {
 export interface CreateConversationRequest {
   title?: string;
   model_id: string;
-  mcp_server_id?: string;
+  mcp_server_ids?: string[];
+}
+
+export interface UpdateConversationRequest {
+  title?: string;
+  model_id?: string;
+  mcp_server_ids?: string[];
 }
 
 export interface SendMessageRequest {
@@ -109,7 +119,7 @@ export interface EditMessageRequest {
 }
 
 export interface SSEEvent {
-  type: 'chunk' | 'done' | 'error' | 'tool_use' | 'tool_result';
+  type: 'chunk' | 'done' | 'error' | 'tool_use' | 'tool_result' | 'usage';
   content: string;
   // tool_use event fields
   tool?: string;
@@ -118,4 +128,8 @@ export interface SSEEvent {
   msg_id?: string;
   // tool_result event fields
   tool_call_id?: string;
+  // usage event fields
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
 }

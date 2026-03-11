@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Plus, Pencil, Trash2, Eye, EyeOff, ChevronDown, ChevronUp } from 'lucide-react';
+import { Plus, Pencil, Trash2, Eye, EyeOff, ChevronDown, ChevronUp, RefreshCw, ChevronsDown } from 'lucide-react';
 import { useAppStore } from '../../store';
 import { modelsApi } from '../../api';
 import type { ModelConfig, CreateModelRequest, UpdateModelRequest } from '../../types';
@@ -35,10 +35,12 @@ function ModelForm({
   initial,
   onSave,
   onCancel,
+  onAddAll,
 }: {
   initial?: ModelConfig;
   onSave: (data: CreateModelRequest | UpdateModelRequest) => Promise<void>;
   onCancel: () => void;
+  onAddAll?: (items: CreateModelRequest[]) => Promise<void>;
 }) {
   const [form, setForm] = useState<FormData>({
     name: initial?.name ?? '',
@@ -60,6 +62,44 @@ function ModelForm({
        initial?.max_tokens != null || initial?.presence_penalty != null || initial?.frequency_penalty != null)
   );
   const [saving, setSaving] = useState(false);
+  const [addingAll, setAddingAll] = useState(false);
+  const [discovering, setDiscovering] = useState(false);
+  const [discoveredModels, setDiscoveredModels] = useState<string[] | null>(null);
+  const [discoverError, setDiscoverError] = useState<string | null>(null);
+
+  const handleDiscover = async () => {
+    if (!form.baseUrl) return;
+    setDiscovering(true);
+    setDiscoverError(null);
+    setDiscoveredModels(null);
+    try {
+      const ids = await modelsApi.discover(form.baseUrl, form.apiKey);
+      setDiscoveredModels(ids);
+      if (ids.length > 0 && form.modelId === '') {
+        setForm((f) => ({ ...f, modelId: ids[0] }));
+      }
+    } catch (err) {
+      setDiscoverError(err instanceof Error ? err.message : 'Failed to fetch models');
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
+  const handleAddAll = async () => {
+    if (!onAddAll || !discoveredModels || discoveredModels.length === 0) return;
+    setAddingAll(true);
+    try {
+      const items: CreateModelRequest[] = discoveredModels.map((id) => ({
+        name: id,
+        base_url: form.baseUrl,
+        api_key: form.apiKey,
+        model_id: id,
+      }));
+      await onAddAll(items);
+    } finally {
+      setAddingAll(false);
+    }
+  };
 
   const set = (field: keyof FormData) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
     setForm((f) => ({ ...f, [field]: e.target.value }));
@@ -191,15 +231,68 @@ function ModelForm({
         <label className="block text-xs font-medium mb-1" style={labelStyle}>
           Model ID
         </label>
-        <input
-          type="text"
-          value={form.modelId}
-          onChange={set('modelId')}
-          required
-          placeholder="e.g. gpt-4o"
-          className="w-full px-3 py-2 text-sm rounded-lg focus:outline-none focus:ring-2"
-          style={inputStyle}
-        />
+        <div className="flex gap-2">
+          {discoveredModels && discoveredModels.length > 0 ? (
+            <select
+              value={form.modelId}
+              onChange={(e) => setForm((f) => ({ ...f, modelId: e.target.value }))}
+              required
+              className="flex-1 px-3 py-2 text-sm rounded-lg focus:outline-none focus:ring-2"
+              style={inputStyle}
+            >
+              {discoveredModels.map((id) => (
+                <option key={id} value={id}>{id}</option>
+              ))}
+            </select>
+          ) : (
+            <input
+              type="text"
+              value={form.modelId}
+              onChange={set('modelId')}
+              required
+              placeholder="e.g. gpt-4o"
+              className="flex-1 px-3 py-2 text-sm rounded-lg focus:outline-none focus:ring-2"
+              style={inputStyle}
+            />
+          )}
+          <button
+            type="button"
+            onClick={handleDiscover}
+            disabled={!form.baseUrl || discovering}
+            title={form.baseUrl ? 'Load available models from this endpoint' : 'Enter a Base URL first'}
+            className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg disabled:opacity-40 transition-colors flex-shrink-0"
+            style={{
+              color: 'var(--color-text-secondary)',
+              backgroundColor: 'var(--color-bg-primary)',
+              border: '1px solid var(--color-border)',
+            }}
+          >
+            <RefreshCw size={13} className={discovering ? 'animate-spin' : ''} />
+            {discovering ? 'Loading…' : 'Load models'}
+          </button>
+        </div>
+        {discoverError && (
+          <p className="text-xs mt-1" style={{ color: '#ef4444' }}>{discoverError}</p>
+        )}
+        {discoveredModels && discoveredModels.length === 0 && (
+          <p className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>No models returned by this endpoint.</p>
+        )}
+        {onAddAll && discoveredModels && discoveredModels.length > 1 && (
+          <button
+            type="button"
+            onClick={handleAddAll}
+            disabled={addingAll}
+            className="flex items-center gap-1.5 mt-2 px-3 py-1.5 text-xs font-medium rounded-lg disabled:opacity-40 transition-colors"
+            style={{
+              color: 'var(--color-text-secondary)',
+              backgroundColor: 'var(--color-bg-primary)',
+              border: '1px solid var(--color-border)',
+            }}
+          >
+            <ChevronsDown size={13} />
+            {addingAll ? 'Adding…' : `Add all ${discoveredModels.length} models`}
+          </button>
+        )}
       </div>
 
       {/* ── Advanced settings toggle ── */}
@@ -361,6 +454,12 @@ export default function ModelsSettings() {
     loadModels();
   };
 
+  const handleAddAll = async (items: CreateModelRequest[]) => {
+    await Promise.all(items.map((item) => modelsApi.create(item)));
+    setShowForm(false);
+    loadModels();
+  };
+
   const handleUpdate = async (data: CreateModelRequest | UpdateModelRequest) => {
     if (editing) {
       await modelsApi.update(editing.id, data as UpdateModelRequest);
@@ -397,7 +496,7 @@ export default function ModelsSettings() {
       </div>
 
       {showForm && (
-        <ModelForm onSave={handleCreate} onCancel={() => setShowForm(false)} />
+        <ModelForm onSave={handleCreate} onCancel={() => setShowForm(false)} onAddAll={handleAddAll} />
       )}
 
       {editing && (

@@ -12,6 +12,7 @@ import (
 
 	mcpclient "github.com/camillebizeul/test3/backend/mcp"
 	"github.com/camillebizeul/test3/backend/models"
+	"github.com/google/uuid"
 )
 
 // Client handles communication with an OpenAI-compatible LLM API.
@@ -35,17 +36,29 @@ type ChatMessage struct {
 // strPtr is a helper to create a *string from a string value.
 func strPtr(s string) *string { return &s }
 
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type chatRequest struct {
 	Model            string          `json:"model"`
 	Messages         []ChatMessage   `json:"messages"`
 	Tools            json.RawMessage `json:"tools,omitempty"`
 	ToolChoice       string          `json:"tool_choice,omitempty"`
 	Stream           bool            `json:"stream"`
+	StreamOptions    *streamOptions  `json:"stream_options,omitempty"`
 	Temperature      *float64        `json:"temperature,omitempty"`
 	TopP             *float64        `json:"top_p,omitempty"`
 	MaxTokens        *int            `json:"max_tokens,omitempty"`
 	PresencePenalty  *float64        `json:"presence_penalty,omitempty"`
 	FrequencyPenalty *float64        `json:"frequency_penalty,omitempty"`
+}
+
+// Usage holds token counts returned by the LLM API.
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 type chatResponse struct {
@@ -79,6 +92,7 @@ type functionCall struct {
 
 type streamChunk struct {
 	Choices []chatChoice `json:"choices"`
+	Usage   *Usage       `json:"usage,omitempty"`
 }
 
 // NewClient creates a new LLM client for the given model configuration.
@@ -133,14 +147,42 @@ type ToolUseCallback func(toolCallID string, toolName string, args map[string]in
 // toolCallID is the OpenAI tool_call_id, toolName is the function name, result is the raw result text.
 type ToolResultCallback func(toolCallID string, toolName string, result string)
 
-// buildMessages prepends a system prompt (if configured) to the conversation history.
-func (c *Client) buildMessages(messages []ChatMessage) []ChatMessage {
-	if c.cfg.SystemPrompt == "" {
+// UsageCallback is called once after each LLM round-trip with the final token counts.
+// It accumulates across multiple loop iterations (tool-call rounds).
+type UsageCallback func(usage Usage)
+
+// AssistantToolCallsCallback is called once per LLM round-trip that returns tool
+// calls, immediately after the response is parsed and before any tool is executed.
+// It receives the full content string (may be empty) and the serialized tool_calls
+// JSON so the caller can persist the assistant+tool_calls message to the DB.
+type AssistantToolCallsCallback func(content string, toolCallsJSON json.RawMessage)
+
+// toolUseInstruction is appended to the system prompt whenever tools are
+// available. It prevents the model from describing a tool call in prose
+// instead of actually invoking it.
+const toolUseInstruction = `You have access to tools. NEVER describe a tool call or suggest one in text — always invoke tools directly when you need information or need to perform an action. If a tool result indicates more data is available (e.g. has_more=true or suggests a follow-up call), always make that follow-up tool call before responding to the user.`
+
+// buildMessages prepends a system prompt to the conversation history.
+// When tools are present, a tool-use enforcement instruction is always included
+// (appended to the user-configured system prompt if one exists, or used alone).
+func (c *Client) buildMessages(messages []ChatMessage, hasTools bool) []ChatMessage {
+	var systemContent string
+	if c.cfg.SystemPrompt != "" {
+		systemContent = c.cfg.SystemPrompt
+	}
+	if hasTools {
+		if systemContent != "" {
+			systemContent += "\n\n" + toolUseInstruction
+		} else {
+			systemContent = toolUseInstruction
+		}
+	}
+	if systemContent == "" {
 		return messages
 	}
 	system := ChatMessage{
 		Role:    "system",
-		Content: strPtr(c.cfg.SystemPrompt),
+		Content: strPtr(systemContent),
 	}
 	out := make([]ChatMessage, 0, len(messages)+1)
 	out = append(out, system)
@@ -148,22 +190,51 @@ func (c *Client) buildMessages(messages []ChatMessage) []ChatMessage {
 	return out
 }
 
+// buildToolClientMap builds a map from tool name → the MCP client that registered it.
+// When multiple clients expose the same tool name, the last one wins.
+func buildToolClientMap(clients []*mcpclient.Client, tools []models.MCPTool) map[string]*mcpclient.Client {
+	m := make(map[string]*mcpclient.Client, len(tools))
+	if len(clients) == 0 {
+		return m
+	}
+	for _, cli := range clients {
+		if cli == nil {
+			continue
+		}
+		for _, t := range cli.Tools() {
+			m[t.Name] = cli
+		}
+	}
+	return m
+}
+
 // SendMessage sends a message to the LLM and handles the tool-calling loop.
 // It calls streamCb with each text chunk as it arrives.
 // It calls toolUseCb (if non-nil) before each MCP tool invocation.
 // It calls toolResultCb (if non-nil) after each MCP tool invocation with the result.
+// It calls usageCb (if non-nil) once per LLM round-trip with cumulative token counts.
 // It returns the full assistant response and the full message history.
 // If ctx is cancelled the loop stops early; partial content and a context error are returned.
+//
+// mcpClients is a slice of MCP clients; tool calls are routed to the client that
+// registered the requested tool. Pass nil or an empty slice to disable tool use.
 func (c *Client) SendMessage(
 	ctx context.Context,
 	messages []ChatMessage,
 	mcpTools []models.MCPTool,
-	mcpClient *mcpclient.Client,
+	mcpClients []*mcpclient.Client,
 	streamCb StreamCallback,
 	toolUseCb ToolUseCallback,
 	toolResultCb ToolResultCallback,
+	usageCb UsageCallback,
+	assistantToolCallsCb AssistantToolCallsCallback,
 ) (string, []ChatMessage, error) {
 	toolsJSON := ToolsToOpenAI(mcpTools)
+
+	// Build a map from tool name → the client that owns it, for O(1) routing.
+	toolClientMap := buildToolClientMap(mcpClients, mcpTools)
+
+	var cumulativeUsage Usage
 
 	for {
 		// Stop immediately if the caller cancelled before the next LLM round-trip.
@@ -173,8 +244,9 @@ func (c *Client) SendMessage(
 
 		req := chatRequest{
 			Model:            c.modelID,
-			Messages:         c.buildMessages(messages),
+			Messages:         c.buildMessages(messages, len(toolsJSON) > 0),
 			Stream:           true,
+			StreamOptions:    &streamOptions{IncludeUsage: true},
 			Temperature:      c.cfg.Temperature,
 			TopP:             c.cfg.TopP,
 			MaxTokens:        c.cfg.MaxTokens,
@@ -210,7 +282,7 @@ func (c *Client) SendMessage(
 		}
 
 		// Parse SSE stream
-		fullContent, toolCalls, err := c.parseStream(ctx, resp.Body, streamCb)
+		fullContent, toolCalls, roundUsage, err := c.parseStream(ctx, resp.Body, streamCb)
 		resp.Body.Close()
 		if err != nil {
 			// If the context was cancelled, return the partial content collected so far
@@ -219,6 +291,14 @@ func (c *Client) SendMessage(
 				return fullContent, messages, ctx.Err()
 			}
 			return "", messages, fmt.Errorf("parse stream: %w", err)
+		}
+
+		// Accumulate token counts across tool-call loop iterations.
+		cumulativeUsage.PromptTokens += roundUsage.PromptTokens
+		cumulativeUsage.CompletionTokens += roundUsage.CompletionTokens
+		cumulativeUsage.TotalTokens += roundUsage.TotalTokens
+		if usageCb != nil && (roundUsage.TotalTokens > 0) {
+			usageCb(cumulativeUsage)
 		}
 
 		if len(toolCalls) == 0 {
@@ -253,7 +333,13 @@ func (c *Client) SendMessage(
 			ToolCalls: tcJSON,
 		})
 
-		// Execute each tool call via MCP
+		// Persist the assistant+tool_calls message before executing tools so
+		// the DB always has the full valid OpenAI message sequence.
+		if assistantToolCallsCb != nil {
+			assistantToolCallsCb(fullContent, tcJSON)
+		}
+
+		// Execute each tool call via the appropriate MCP client
 		for _, tc := range toolCalls {
 			// Stop tool execution if context was cancelled.
 			if err := ctx.Err(); err != nil {
@@ -269,9 +355,12 @@ func (c *Client) SendMessage(
 				toolUseCb(tc.ID, tc.Function.Name, args)
 			}
 
+			// Route this tool call to the client that owns the tool.
+			ownerClient := toolClientMap[tc.Function.Name]
+
 			result := "Tool execution failed"
-			if mcpClient != nil {
-				toolResult, err := mcpClient.CallTool(ctx, tc.Function.Name, args)
+			if ownerClient != nil {
+				toolResult, err := ownerClient.CallTool(ctx, tc.Function.Name, args)
 				if err != nil {
 					result = fmt.Sprintf("Error: %v", err)
 				} else {
@@ -289,18 +378,86 @@ func (c *Client) SendMessage(
 				ToolCallID: tc.ID,
 				Name:       tc.Function.Name,
 			})
+
+			// Some MCP servers embed a follow-up call suggestion in the tool
+			// result text (e.g. "Use the following call to get the contents
+			// [{"name":"get_file_chunks","arguments":{...}}]"). Execute those
+			// calls immediately so the model receives their results instead of
+			// just seeing the suggestion and echoing it to the user.
+			if ownerClient != nil {
+				for _, embedded := range extractEmbeddedCalls(result) {
+					if ctx.Err() != nil {
+						break
+					}
+					embeddedID := uuid.New().String()
+
+					// Build a synthetic assistant message with tool_calls so
+					// the history stays valid for the OpenAI API.
+					type outToolCall struct {
+						ID       string       `json:"id"`
+						Type     string       `json:"type"`
+						Function functionCall `json:"function"`
+					}
+					embeddedArgsJSON, _ := json.Marshal(embedded.Arguments)
+					syntheticTCs := []outToolCall{{
+						ID:   embeddedID,
+						Type: "function",
+						Function: functionCall{
+							Name:      embedded.Name,
+							Arguments: string(embeddedArgsJSON),
+						},
+					}}
+					syntheticTCsJSON, _ := json.Marshal(syntheticTCs)
+					messages = append(messages, ChatMessage{
+						Role:      "assistant",
+						Content:   nil,
+						ToolCalls: syntheticTCsJSON,
+					})
+
+					// Persist the synthetic assistant+tool_calls message too.
+					if assistantToolCallsCb != nil {
+						assistantToolCallsCb("", syntheticTCsJSON)
+					}
+
+					if toolUseCb != nil {
+						toolUseCb(embeddedID, embedded.Name, embedded.Arguments)
+					}
+
+					// Route the embedded call to the same client as the parent tool
+					// (embedded calls are defined by the same server).
+					embeddedResult := "Tool execution failed"
+					embeddedToolResult, err := ownerClient.CallTool(ctx, embedded.Name, embedded.Arguments)
+					if err != nil {
+						embeddedResult = fmt.Sprintf("Error: %v", err)
+					} else {
+						embeddedResult = embeddedToolResult
+					}
+
+					if toolResultCb != nil {
+						toolResultCb(embeddedID, embedded.Name, embeddedResult)
+					}
+
+					messages = append(messages, ChatMessage{
+						Role:       "tool",
+						Content:    strPtr(embeddedResult),
+						ToolCallID: embeddedID,
+						Name:       embedded.Name,
+					})
+				}
+			}
 		}
 
 		// Loop back to send tool results to LLM
 	}
 }
 
-func (c *Client) parseStream(ctx context.Context, body io.Reader, streamCb StreamCallback) (string, []toolCall, error) {
+func (c *Client) parseStream(ctx context.Context, body io.Reader, streamCb StreamCallback) (string, []toolCall, Usage, error) {
 	// Read line by line for SSE format
 	buf := make([]byte, 0, 4096)
 	rawBuf := make([]byte, 4096)
 	var fullContent strings.Builder
 	var accumulatedToolCalls []toolCall
+	var usage Usage
 
 	for {
 		// Bail out promptly if context was cancelled.
@@ -336,6 +493,12 @@ func (c *Client) parseStream(ctx context.Context, body io.Reader, streamCb Strea
 						continue
 					}
 
+					// Capture usage from the final chunk (sent after [DONE] by some
+					// providers, or in the last data chunk with stream_options).
+					if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
+						usage = *chunk.Usage
+					}
+
 					for _, choice := range chunk.Choices {
 						if choice.Delta.Content != "" {
 							fullContent.WriteString(choice.Delta.Content)
@@ -355,12 +518,67 @@ func (c *Client) parseStream(ctx context.Context, body io.Reader, streamCb Strea
 			break
 		}
 		if err != nil {
-			return fullContent.String(), accumulatedToolCalls, err
+			return fullContent.String(), accumulatedToolCalls, usage, err
 		}
 	}
 
 done:
-	return fullContent.String(), accumulatedToolCalls, nil
+	return fullContent.String(), accumulatedToolCalls, usage, nil
+}
+
+// embeddedCall represents a follow-up tool call suggested inside a tool result.
+type embeddedCall struct {
+	Name      string                 `json:"name"`
+	Arguments map[string]interface{} `json:"arguments"`
+}
+
+// extractEmbeddedCalls scans a tool result string for an embedded follow-up
+// call list of the form:
+//
+//	[{"name": "tool_name", "arguments": {...}}, ...]
+//
+// Some MCP servers return this pattern to instruct the client to issue a
+// subsequent tool invocation (e.g. "Use the following call to get the
+// contents [...]"). When found the calls are returned so the agent loop can
+// execute them immediately instead of waiting for the LLM to re-request them.
+func extractEmbeddedCalls(result string) []embeddedCall {
+	// Find the first '[' that opens what might be a call list.
+	start := strings.Index(result, "[{")
+	if start < 0 {
+		return nil
+	}
+	// Find the matching closing ']' (simple bracket counting).
+	depth := 0
+	end := -1
+	for i := start; i < len(result); i++ {
+		switch result[i] {
+		case '[', '{':
+			depth++
+		case ']', '}':
+			depth--
+			if depth == 0 {
+				end = i
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 {
+		return nil
+	}
+	candidate := result[start : end+1]
+	var calls []embeddedCall
+	if err := json.Unmarshal([]byte(candidate), &calls); err != nil {
+		return nil
+	}
+	// Only treat as embedded calls when every entry has a non-empty name.
+	for _, c := range calls {
+		if c.Name == "" {
+			return nil
+		}
+	}
+	return calls
 }
 
 // mergeToolCalls handles the streaming tool call accumulation where each

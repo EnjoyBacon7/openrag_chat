@@ -56,6 +56,7 @@ func main() {
 		// Models
 		r.Get("/models", modelH.List)
 		r.Post("/models", modelH.Create)
+		r.Post("/models/discover", modelH.Discover)
 		r.Put("/models/{id}", modelH.Update)
 		r.Delete("/models/{id}", modelH.Delete)
 

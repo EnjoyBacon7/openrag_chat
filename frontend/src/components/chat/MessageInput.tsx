@@ -12,7 +12,7 @@ export default function MessageInput() {
 
   const activeConversationId = useAppStore((s) => s.activeConversationId);
   const selectedModelId = useAppStore((s) => s.selectedModelId);
-  const selectedMCPServerId = useAppStore((s) => s.selectedMCPServerId);
+  const selectedMCPServerIds = useAppStore((s) => s.selectedMCPServerIds);
   const isStreaming = useAppStore((s) => s.isStreaming);
   const setIsStreaming = useAppStore((s) => s.setIsStreaming);
   const appendStreamingContent = useAppStore((s) => s.appendStreamingContent);
@@ -20,8 +20,8 @@ export default function MessageInput() {
   const addMessage = useAppStore((s) => s.addMessage);
   const setActiveConversation = useAppStore((s) => s.setActiveConversation);
   const loadConversations = useAppStore((s) => s.loadConversations);
-  const clearSelectionChangeBanner = useAppStore((s) => s.clearSelectionChangeBanner);
   const models = useAppStore((s) => s.models);
+  const setLastUsage = useAppStore((s) => s.setLastUsage);
 
   // Cancel any in-flight stream on unmount
   useEffect(() => {
@@ -37,7 +37,6 @@ export default function MessageInput() {
     const content = text.trim();
     if (!content || isStreaming || !selectedModelId) return;
 
-    clearSelectionChangeBanner();
     setText('');
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
@@ -49,7 +48,7 @@ export default function MessageInput() {
       try {
         const conv = await conversationsApi.create({
           model_id: selectedModelId,
-          mcp_server_id: selectedMCPServerId || undefined,
+          mcp_server_ids: selectedMCPServerIds.length > 0 ? selectedMCPServerIds : undefined,
         });
         convId = conv.id;
         await setActiveConversation(convId);
@@ -136,12 +135,15 @@ export default function MessageInput() {
         resetStreamingContent();
         loadConversations();
       },
+      (usage) => {
+        setLastUsage(usage);
+      },
     );
   }, [
     text,
     isStreaming,
     selectedModelId,
-    selectedMCPServerId,
+    selectedMCPServerIds,
     activeConversationId,
     addMessage,
     setIsStreaming,
@@ -149,7 +151,7 @@ export default function MessageInput() {
     resetStreamingContent,
     setActiveConversation,
     loadConversations,
-    clearSelectionChangeBanner,
+    setLastUsage,
     navigate,
   ]);
 

@@ -43,15 +43,14 @@ func setupSSE(w http.ResponseWriter) http.Flusher {
 	return f
 }
 
-// sseCallbacks builds the three LLM callbacks (stream, tool_use, tool_result)
-// that write SSE events to w and persist messages to the DB.
-// writeFailed is set to true the first time a write to the client fails (i.e. client disconnected).
+// sseCallbacks builds the five LLM callbacks (stream, tool_use, tool_result, usage,
+// assistant_tool_calls) that write SSE events to w and persist messages to the DB.
 func sseCallbacks(
 	w http.ResponseWriter,
 	flusher http.Flusher,
 	database *db.DB,
 	conversationID string,
-) (llm.StreamCallback, llm.ToolUseCallback, llm.ToolResultCallback) {
+) (llm.StreamCallback, llm.ToolUseCallback, llm.ToolResultCallback, llm.UsageCallback, llm.AssistantToolCallsCallback) {
 
 	streamCb := func(text string) {
 		data, _ := json.Marshal(map[string]string{"type": "chunk", "content": text})
@@ -123,5 +122,33 @@ func sseCallbacks(
 		flusher.Flush()
 	}
 
-	return streamCb, toolUseCb, toolResultCb
+	usageCb := func(usage llm.Usage) {
+		data, _ := json.Marshal(map[string]interface{}{
+			"type":              "usage",
+			"prompt_tokens":     usage.PromptTokens,
+			"completion_tokens": usage.CompletionTokens,
+			"total_tokens":      usage.TotalTokens,
+		})
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+		if err := database.UpdateConversationUsage(conversationID, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens); err != nil {
+			log.Printf("failed to persist usage for conversation %s: %v", conversationID, err)
+		}
+	}
+
+	assistantToolCallsCb := func(content string, toolCallsJSON json.RawMessage) {
+		msg := models.Message{
+			ID:             uuid.New().String(),
+			ConversationID: conversationID,
+			Role:           "assistant",
+			Content:        content,
+			ToolCalls:      string(toolCallsJSON),
+			CreatedAt:      time.Now().UTC(),
+		}
+		if err := database.AddMessage(msg); err != nil {
+			log.Printf("Error saving assistant tool_calls message: %v", err)
+		}
+	}
+
+	return streamCb, toolUseCb, toolResultCb, usageCb, assistantToolCallsCb
 }

@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -111,6 +112,15 @@ func (db *DB) migrate() error {
 	db.conn.Exec("ALTER TABLE models ADD COLUMN max_tokens INTEGER")
 	db.conn.Exec("ALTER TABLE models ADD COLUMN presence_penalty REAL")
 	db.conn.Exec("ALTER TABLE models ADD COLUMN frequency_penalty REAL")
+	db.conn.Exec("ALTER TABLE conversations ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0")
+	db.conn.Exec("ALTER TABLE conversations ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0")
+	db.conn.Exec("ALTER TABLE conversations ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0")
+	db.conn.Exec("ALTER TABLE conversations ADD COLUMN mcp_server_ids TEXT NOT NULL DEFAULT ''")
+
+	// Migrate old single mcp_server_id to the new mcp_server_ids JSON array.
+	// Only runs when the old column has a value and the new column is still empty.
+	db.conn.Exec(`UPDATE conversations SET mcp_server_ids = '["' || mcp_server_id || '"]'
+		WHERE mcp_server_id != '' AND (mcp_server_ids IS NULL OR mcp_server_ids = '')`)
 
 	return nil
 }
@@ -404,8 +414,49 @@ func (db *DB) DeleteMCPServer(id string) error {
 // Conversations
 // ──────────────────────────────────────────────
 
+// parseMCPServerIDs decodes a JSON array string into a []string.
+// Returns an empty slice if the input is empty or invalid.
+func parseMCPServerIDs(raw string) []string {
+	if raw == "" {
+		return []string{}
+	}
+	var ids []string
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+		return []string{}
+	}
+	return ids
+}
+
+// encodeMCPServerIDs serialises a []string to a JSON array string.
+func encodeMCPServerIDs(ids []string) string {
+	if len(ids) == 0 {
+		return "[]"
+	}
+	b, _ := json.Marshal(ids)
+	return string(b)
+}
+
+// scanConversation scans a conversations SELECT row into a Conversation.
+// Columns: id, title, model_id, mcp_server_id, mcp_server_ids,
+//
+//	prompt_tokens, completion_tokens, total_tokens, created_at, updated_at
+func scanConversation(rows *sql.Rows) (models.Conversation, error) {
+	var c models.Conversation
+	var createdTS, updatedTS, mcpServerID, mcpServerIDsJSON string
+	err := rows.Scan(&c.ID, &c.Title, &c.ModelID, &mcpServerID, &mcpServerIDsJSON,
+		&c.PromptTokens, &c.CompletionTokens, &c.TotalTokens, &createdTS, &updatedTS)
+	if err != nil {
+		return c, err
+	}
+	c.MCPServerID = mcpServerID
+	c.MCPServerIDs = parseMCPServerIDs(mcpServerIDsJSON)
+	c.CreatedAt = parseTime(createdTS)
+	c.UpdatedAt = parseTime(updatedTS)
+	return c, nil
+}
+
 func (db *DB) ListConversations() ([]models.Conversation, error) {
-	rows, err := db.conn.Query("SELECT id, title, model_id, mcp_server_id, created_at, updated_at FROM conversations ORDER BY updated_at DESC")
+	rows, err := db.conn.Query("SELECT id, title, model_id, mcp_server_id, mcp_server_ids, prompt_tokens, completion_tokens, total_tokens, created_at, updated_at FROM conversations ORDER BY updated_at DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -413,13 +464,10 @@ func (db *DB) ListConversations() ([]models.Conversation, error) {
 
 	var out []models.Conversation
 	for rows.Next() {
-		var c models.Conversation
-		var createdTS, updatedTS string
-		if err := rows.Scan(&c.ID, &c.Title, &c.ModelID, &c.MCPServerID, &createdTS, &updatedTS); err != nil {
+		c, err := scanConversation(rows)
+		if err != nil {
 			return nil, err
 		}
-		c.CreatedAt = parseTime(createdTS)
-		c.UpdatedAt = parseTime(updatedTS)
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -427,15 +475,17 @@ func (db *DB) ListConversations() ([]models.Conversation, error) {
 
 func (db *DB) GetConversation(id string) (*models.ConversationWithMessages, error) {
 	var c models.ConversationWithMessages
-	var createdTS, updatedTS string
-	err := db.conn.QueryRow("SELECT id, title, model_id, mcp_server_id, created_at, updated_at FROM conversations WHERE id = ?", id).
-		Scan(&c.ID, &c.Title, &c.ModelID, &c.MCPServerID, &createdTS, &updatedTS)
+	var createdTS, updatedTS, mcpServerID, mcpServerIDsJSON string
+	err := db.conn.QueryRow("SELECT id, title, model_id, mcp_server_id, mcp_server_ids, prompt_tokens, completion_tokens, total_tokens, created_at, updated_at FROM conversations WHERE id = ?", id).
+		Scan(&c.ID, &c.Title, &c.ModelID, &mcpServerID, &mcpServerIDsJSON, &c.PromptTokens, &c.CompletionTokens, &c.TotalTokens, &createdTS, &updatedTS)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	c.MCPServerID = mcpServerID
+	c.MCPServerIDs = parseMCPServerIDs(mcpServerIDsJSON)
 	c.CreatedAt = parseTime(createdTS)
 	c.UpdatedAt = parseTime(updatedTS)
 
@@ -463,16 +513,20 @@ func (db *DB) CreateConversation(req models.CreateConversationRequest) (*models.
 	if title == "" {
 		title = "New Chat"
 	}
+	mcpServerIDsJSON := encodeMCPServerIDs(req.MCPServerIDs)
 	c := models.Conversation{
-		ID:          uuid.New().String(),
-		Title:       title,
-		ModelID:     req.ModelID,
-		MCPServerID: req.MCPServerID,
-		CreatedAt:   time.Now().UTC(),
-		UpdatedAt:   time.Now().UTC(),
+		ID:           uuid.New().String(),
+		Title:        title,
+		ModelID:      req.ModelID,
+		MCPServerIDs: req.MCPServerIDs,
+		CreatedAt:    time.Now().UTC(),
+		UpdatedAt:    time.Now().UTC(),
 	}
-	_, err := db.conn.Exec("INSERT INTO conversations (id, title, model_id, mcp_server_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-		c.ID, c.Title, c.ModelID, c.MCPServerID,
+	if c.MCPServerIDs == nil {
+		c.MCPServerIDs = []string{}
+	}
+	_, err := db.conn.Exec("INSERT INTO conversations (id, title, model_id, mcp_server_ids, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+		c.ID, c.Title, c.ModelID, mcpServerIDsJSON,
 		c.CreatedAt.Format("2006-01-02 15:04:05"),
 		c.UpdatedAt.Format("2006-01-02 15:04:05"))
 	if err != nil {
@@ -484,7 +538,21 @@ func (db *DB) CreateConversation(req models.CreateConversationRequest) (*models.
 func (db *DB) UpdateConversation(id string, req models.UpdateConversationRequest) error {
 	if req.Title != nil {
 		_, err := db.conn.Exec("UPDATE conversations SET title=?, updated_at=datetime('now') WHERE id=?", *req.Title, id)
-		return err
+		if err != nil {
+			return err
+		}
+	}
+	if req.ModelID != nil {
+		_, err := db.conn.Exec("UPDATE conversations SET model_id=?, updated_at=datetime('now') WHERE id=?", *req.ModelID, id)
+		if err != nil {
+			return err
+		}
+	}
+	if req.MCPServerIDs != nil {
+		_, err := db.conn.Exec("UPDATE conversations SET mcp_server_ids=?, updated_at=datetime('now') WHERE id=?", encodeMCPServerIDs(*req.MCPServerIDs), id)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -507,6 +575,14 @@ func (db *DB) DeleteConversation(id string) error {
 
 func (db *DB) TouchConversation(id string) error {
 	_, err := db.conn.Exec("UPDATE conversations SET updated_at=datetime('now') WHERE id=?", id)
+	return err
+}
+
+func (db *DB) UpdateConversationUsage(id string, promptTokens, completionTokens, totalTokens int) error {
+	_, err := db.conn.Exec(
+		"UPDATE conversations SET prompt_tokens=?, completion_tokens=?, total_tokens=?, updated_at=datetime('now') WHERE id=?",
+		promptTokens, completionTokens, totalTokens, id,
+	)
 	return err
 }
 

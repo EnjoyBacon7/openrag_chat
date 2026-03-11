@@ -51,12 +51,8 @@ interface AppState {
   // Selected model & MCP for new chats
   selectedModelId: string | null;
   setSelectedModelId: (id: string | null) => void;
-  selectedMCPServerId: string | null;
-  setSelectedMCPServerId: (id: string | null) => void;
-
-  // Transient banner shown when model/MCP changes mid-conversation
-  selectionChangeBanner: string | null;
-  clearSelectionChangeBanner: () => void;
+  selectedMCPServerIds: string[];
+  setSelectedMCPServerIds: (ids: string[]) => void;
 
   // Streaming state
   isStreaming: boolean;
@@ -64,6 +60,10 @@ interface AppState {
   setIsStreaming: (v: boolean) => void;
   appendStreamingContent: (text: string) => void;
   resetStreamingContent: () => void;
+
+  // Token usage for the active conversation (updated after each response)
+  lastUsage: { promptTokens: number; completionTokens: number; totalTokens: number } | null;
+  setLastUsage: (usage: { promptTokens: number; completionTokens: number; totalTokens: number } | null) => void;
 
   // Add a message to the active conversation locally
   addMessage: (msg: Message) => void;
@@ -122,7 +122,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   activeMessages: [],
   setActiveConversation: async (id) => {
     if (!id) {
-      set({ activeConversationId: null, activeMessages: [] });
+      set({ activeConversationId: null, activeMessages: [], lastUsage: null });
       return;
     }
     const conv = await conversationsApi.get(id);
@@ -130,33 +130,33 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeConversationId: id,
       activeMessages: conv.messages,
       selectedModelId: conv.model_id || get().selectedModelId,
-      selectedMCPServerId: conv.mcp_server_id || get().selectedMCPServerId,
+      selectedMCPServerIds: conv.mcp_server_ids ?? [],
+      lastUsage: conv.total_tokens > 0
+        ? { promptTokens: conv.prompt_tokens, completionTokens: conv.completion_tokens, totalTokens: conv.total_tokens }
+        : null,
     });
   },
 
   selectedModelId: null,
   setSelectedModelId: (id) => {
-    const { activeConversationId, models } = get();
+    const { activeConversationId } = get();
+    set({ selectedModelId: id });
     if (activeConversationId && id) {
-      const model = models.find((m) => m.id === id);
-      set({ selectedModelId: id, selectionChangeBanner: `Switched to ${model?.name ?? id} — applies to the next message.` });
-    } else {
-      set({ selectedModelId: id });
+      conversationsApi.update(activeConversationId, { model_id: id }).catch((err) =>
+        console.error('Failed to persist model change:', err)
+      );
     }
   },
-  selectedMCPServerId: null,
-  setSelectedMCPServerId: (id) => {
-    const { activeConversationId, mcpServers } = get();
+  selectedMCPServerIds: [],
+  setSelectedMCPServerIds: (ids) => {
+    const { activeConversationId } = get();
+    set({ selectedMCPServerIds: ids });
     if (activeConversationId) {
-      const label = id ? (mcpServers.find((s) => s.id === id)?.name ?? id) : 'none';
-      set({ selectedMCPServerId: id, selectionChangeBanner: `MCP server changed to ${label} — applies to the next message.` });
-    } else {
-      set({ selectedMCPServerId: id });
+      conversationsApi.update(activeConversationId, { mcp_server_ids: ids }).catch((err) =>
+        console.error('Failed to persist MCP server change:', err)
+      );
     }
   },
-
-  selectionChangeBanner: null,
-  clearSelectionChangeBanner: () => set({ selectionChangeBanner: null }),
 
   isStreaming: false,
   streamingContent: '',
@@ -164,6 +164,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   appendStreamingContent: (text) =>
     set((s) => ({ streamingContent: s.streamingContent + text })),
   resetStreamingContent: () => set({ streamingContent: '' }),
+
+  lastUsage: null,
+  setLastUsage: (usage) => set({ lastUsage: usage }),
 
   addMessage: (msg) =>
     set((s) => ({ activeMessages: [...s.activeMessages, msg] })),

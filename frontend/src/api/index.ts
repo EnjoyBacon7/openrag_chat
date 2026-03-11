@@ -30,6 +30,11 @@ export const modelsApi = {
     request<import('../types').ModelConfig>(`/models/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   delete: (id: string) =>
     request<void>(`/models/${id}`, { method: 'DELETE' }),
+  discover: (baseUrl: string, apiKey: string) =>
+    request<string[]>('/models/discover', {
+      method: 'POST',
+      body: JSON.stringify({ base_url: baseUrl, api_key: apiKey }),
+    }),
 };
 
 // MCP Servers
@@ -51,7 +56,7 @@ export const conversationsApi = {
   get: (id: string) => request<import('../types').ConversationWithMessages>(`/conversations/${id}`),
   create: (data: import('../types').CreateConversationRequest) =>
     request<import('../types').Conversation>('/conversations', { method: 'POST', body: JSON.stringify(data) }),
-  update: (id: string, data: { title: string }) =>
+  update: (id: string, data: import('../types').UpdateConversationRequest) =>
     request<void>(`/conversations/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   delete: (id: string) =>
     request<void>(`/conversations/${id}`, { method: 'DELETE' }),
@@ -66,8 +71,9 @@ export function sendMessage(
   onToolUse?: (payload: { id: string; tool: string; label: string; args: Record<string, unknown>; toolCallId: string }) => void,
   onToolResult?: (payload: { msgId: string; tool: string; toolCallId: string }) => void,
   onAbort?: () => void,
+  onUsage?: (usage: { promptTokens: number; completionTokens: number; totalTokens: number }) => void,
 ): AbortController {
-  return streamChat(`${API_BASE}/chat/send`, data, onChunk, onDone, onError, onToolUse, onToolResult, onAbort);
+  return streamChat(`${API_BASE}/chat/send`, data, onChunk, onDone, onError, onToolUse, onToolResult, onAbort, onUsage);
 }
 
 export function editMessage(
@@ -78,8 +84,9 @@ export function editMessage(
   onToolUse?: (payload: { id: string; tool: string; label: string; args: Record<string, unknown>; toolCallId: string }) => void,
   onToolResult?: (payload: { msgId: string; tool: string; toolCallId: string }) => void,
   onAbort?: () => void,
+  onUsage?: (usage: { promptTokens: number; completionTokens: number; totalTokens: number }) => void,
 ): AbortController {
-  return streamChat(`${API_BASE}/chat/edit`, data, onChunk, onDone, onError, onToolUse, onToolResult, onAbort);
+  return streamChat(`${API_BASE}/chat/edit`, data, onChunk, onDone, onError, onToolUse, onToolResult, onAbort, onUsage);
 }
 
 function streamChat(
@@ -91,6 +98,7 @@ function streamChat(
   onToolUse?: (payload: { id: string; tool: string; label: string; args: Record<string, unknown>; toolCallId: string }) => void,
   onToolResult?: (payload: { msgId: string; tool: string; toolCallId: string }) => void,
   onAbort?: () => void,
+  onUsage?: (usage: { promptTokens: number; completionTokens: number; totalTokens: number }) => void,
 ): AbortController {
   const controller = new AbortController();
 
@@ -149,6 +157,12 @@ function streamChat(
                 msgId: event.msg_id ?? '',
                 tool: event.tool ?? '',
                 toolCallId: event.tool_call_id ?? '',
+              });
+            } else if (event.type === 'usage' && onUsage) {
+              onUsage({
+                promptTokens: event.prompt_tokens ?? 0,
+                completionTokens: event.completion_tokens ?? 0,
+                totalTokens: event.total_tokens ?? 0,
               });
             }
           } catch {
